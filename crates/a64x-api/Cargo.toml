@@ -1,0 +1,8 @@
+[package]
+name = "a64x-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+a64x-core = { path = "../a64x-core" }

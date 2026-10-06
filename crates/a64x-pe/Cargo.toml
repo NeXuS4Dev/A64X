@@ -1,0 +1,9 @@
+[package]
+name = "a64x-pe"
+description = "A64X PE32+ (ARM64 Windows executable) image parser and test image builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+a64x-core = { path = "../a64x-core" }

@@ -1,0 +1,8 @@
+[package]
+name = "a64x-core"
+description = "A64X core types: guest CPU state, address space, executable memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

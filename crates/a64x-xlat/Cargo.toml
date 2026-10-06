@@ -1,0 +1,10 @@
+[package]
+name = "a64x-xlat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+a64x-core = { path = "../a64x-core" }
+a64x-arm64 = { path = "../a64x-arm64" }
+a64x-x64 = { path = "../a64x-x64" }

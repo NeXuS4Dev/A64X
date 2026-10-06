@@ -1,0 +1,8 @@
+[package]
+name = "a64x-arm64"
+description = "A64X ARMv8-A (A64) instruction decoder, light disassembler and test assembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
