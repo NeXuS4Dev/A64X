@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/a64x-core",
+    "crates/a64x-x64",
+    "crates/a64x-arm64",
+    "crates/a64x-pe",
+    "crates/a64x-api",
+    "crates/a64x-xlat",
+    "crates/a64x-rt",
+    "crates/a64x",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+homepage = "https://github.com/NeXuS4Dev/A64X"
+repository = "https://github.com/NeXuS4Dev/A64X"
+
+# Release profile tuned for the translator's hot paths.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+debug = false
+[profile.bench]
+inherits = "release"
+debug = true

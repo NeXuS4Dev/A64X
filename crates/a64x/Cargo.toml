@@ -1,0 +1,18 @@
+[package]
+name = "a64x"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "a64x"
+path = "src/main.rs"
+
+[dependencies]
+a64x-core = { path = "../a64x-core" }
+a64x-pe = { path = "../a64x-pe" }
+a64x-arm64 = { path = "../a64x-arm64" }
+a64x-xlat = { path = "../a64x-xlat" }
+a64x-rt = { path = "../a64x-rt" }
+[dev-dependencies]
+a64x-rt = { path = "../a64x-rt" }

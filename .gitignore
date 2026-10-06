@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock
+
+# A64X runtime artifacts
+.a64x/cache/
+*.a64xc
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Local scratch
+/tmp
+/out

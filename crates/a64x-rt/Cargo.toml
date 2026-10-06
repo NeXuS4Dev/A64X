@@ -1,0 +1,12 @@
+[package]
+name = "a64x-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+a64x-core = { path = "../a64x-core" }
+a64x-pe = { path = "../a64x-pe" }
+a64x-arm64 = { path = "../a64x-arm64" }
+a64x-xlat = { path = "../a64x-xlat" }
+a64x-api = { path = "../a64x-api" }
