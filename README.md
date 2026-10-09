@@ -40,7 +40,7 @@ $ cargo run -p a64x -- demo --bench 50000000
 | `a64x-arm64`  | ARM64 decoder + assembler subset (bitmask-immediate logic, branches, ld/st) |
 | `a64x-x64`    | x86-64 machine-code emitter |
 | `a64x-xlat`   | **Block translator, code cache (chaining, disk persistence), Machine** |
-| `a64x-api`    | API gateway + registry; portable `kernel32`/`msvcrt` adapters |
+| `a64x-api`    | API gateway + registry; process model (green threads, heaps, VM map, handles, continuations, SEH unwinding); portable `kernel32`, `ucrtbase`, `vcruntime140`, `shell32` adapters |
 | `a64x-rt`     | PE loader (relocations, import binding), dispatcher, demo images, `Guest` |
 | `a64x`        | Command-line frontend |
 
@@ -85,11 +85,15 @@ round.
   bitmask immediates, branches (all forms), cbz/tbz, ld/st every width
   (signed/unsigned, pre/post index, pairs), mul/div family, bitfield
   (SBFM/UBFM/BFM aliases incl. LSL/LSR/ASR extracts), CLZ/REV, CSEL.
-- **Not yet**: FP/SIMD, atomics/barriers, DllMain/TLS callbacks, SEH,
-  `CCMP` — unknown opcodes exit cleanly with the raw word + address.
-- The host API surface is implemented against the adapter ABI (see
-  `crates/a64x-api`); on Windows builds the same registry can bind to the
-  real `kernel32.dll` exports — the guest-facing layout doesn't change.
+- **Not yet in the translator**: FP/SIMD instructions, atomics/barriers,
+  DllMain/TLS callbacks, `CCMP` — unknown opcodes exit cleanly with the raw
+  word + address.
+- The API layer implements structured exception dispatch and `.pdata`/`.xdata`
+  unwinding, but guest exception code only runs once the translator covers
+  the instructions it uses.
+- The API surface is implemented natively against the adapter ABI (see
+  `docs/api-surface.md` for the full list and the known deviations). The
+  runtime does not load the real system DLLs; imports are bound by name.
 
 ## Testing
 
@@ -98,7 +102,7 @@ every translated behavior is verified by observing guest state after
 native execution, including chained hot loops and cache round-trips:
 
 ```console
-$ cargo test --workspace     # 57 tests: decoders, emitters, native exec, end-to-end PE runs, CLI integration
+$ cargo test --workspace     # 117 tests: decoders, emitters, native exec, API adapters, unwinding, threads, exceptions, end-to-end PE runs, CLI integration
 ```
 
 ## License

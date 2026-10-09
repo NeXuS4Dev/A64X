@@ -1,540 +1,630 @@
-//! CRT adapters (msvcrt / ucrtbase) — real native implementations.
+//! UCRT runtime: startup, exit, signals, errno, heap, environment, argv,
+//! error strings, file locks and miscellaneous utilities.
 
-use crate::{arg, read_cstr, ret, win_shared, write_stdout, ApiCtx, ApiDef};
+use crate::cont::{self, AtexitEnd};
+use crate::{heap, reg, sched, shell32, ApiCtx, ApiDef};
 use a64x_core::Result;
+use std::collections::BTreeMap;
 
-macro_rules! api {
-    ($name:expr, $f:ident) => {
-        ApiDef { dll: "msvcrt", name: $name, f: $f }
-    };
-    (ucrt, $name:expr, $f:ident) => {
-        ApiDef { dll: "ucrtbase", name: $name, f: $f }
-    };
-}
+/// Signal numbers accepted by `signal` (UCRT).
+const VALID_SIGNALS: [i32; 8] = [2, 4, 6, 8, 11, 15, 21, 22];
+const SIGABRT: i32 = 22;
+const SIG_DFL: u64 = 0;
+const SIG_ERR: u64 = u64::MAX;
+const EINVAL: i32 = 22;
+const ENOMEM: i32 = 12;
+const EAGAIN: i32 = 11;
+const ERANGE: i32 = 34;
+/// Exit status of a process terminated by an unhandled invalid parameter.
+const FAST_FAIL_INVALID_PARAMETER: u64 = 0xC000_0409;
 
-/// Table of CRT adapters.
-pub(crate) static TABLE: &[ApiDef] = &[
-    api!("puts", puts),
-    api!("putchar", putchar),
-    api!("_putch", putchar),
-    api!("printf", printf),
-    api!("fprintf", fprintf),
-    api!("exit", exit),
-    api!("_exit", exit),
-    api!("abort", abort),
-    api!("malloc", malloc),
-    api!("calloc", calloc),
-    api!("realloc", realloc_crt),
-    api!("free", free),
-    api!("memset", memset_),
-    api!("memcpy", memcpy_),
-    api!("memmove", memmove_),
-    api!("memcmp", memcmp_),
-    api!("strlen", strlen_),
-    api!("strnlen", strnlen_),
-    api!("strcmp", strcmp_),
-    api!("strncmp", strncmp_),
-    api!("_stricmp", stricmp_),
-    api!("strcpy", strcpy_),
-    api!("strncpy", strncpy_),
-    api!("strdup", strdup_),
-    api!("_strdup", strdup_),
-    api!("tolower", tolower_),
-    api!("toupper", toupper_),
-    api!("isspace", isspace_),
-    api!("isdigit", isdigit_),
-    api!("isalpha", isalpha_),
-    api!("atoi", atoi),
-    api!("atol", atoi),
-    api!("abs", abs_),
-    api!("fflush", ok_zero),
-    api!("__acrt_iob_func", acrt_iob_func),
-    // UCRT startup / printf plumbing
-    api!(ucrt, "__stdio_common_vfprintf", stdio_common_vfprintf),
-    api!(ucrt, "__stdio_common_vfwprintf", stdio_common_vfprintf),
-    api!(ucrt, "puts", puts),
-    api!(ucrt, "putchar", putchar),
-    api!(ucrt, "malloc", malloc),
-    api!(ucrt, "calloc", calloc),
-    api!(ucrt, "realloc", realloc_crt),
-    api!(ucrt, "free", free),
-    api!(ucrt, "exit", exit),
-    api!(ucrt, "_exit", exit),
-    api!(ucrt, "abort", abort),
-    api!(ucrt, "memset", memset_),
-    api!(ucrt, "memcpy", memcpy_),
-    api!(ucrt, "memmove", memmove_),
-    api!(ucrt, "memcmp", memcmp_),
-    api!(ucrt, "strlen", strlen_),
-    api!(ucrt, "strcmp", strcmp_),
-    api!(ucrt, "strcpy", strcpy_),
-    api!(ucrt, "_initialize_narrow_environment", ok_zero),
-    api!(ucrt, "_configure_narrow_argv", ok_zero),
-    api!(ucrt, "_set_new_mode", ok_zero),
-    api!(ucrt, "_configthreadlocale", ok_zero),
-    api!(ucrt, "_initterm", ok_zero),
-    api!(ucrt, "_initterm_e", ok_zero),
-    api!(ucrt, "_seh_filter_exe", seh_filter_exe),
-    api!(ucrt, "__setusermatherr", ok_zero),
-    api!(ucrt, "_get_initial_narrow_environment", get_initial_narrow_env),
-    api!(ucrt, "__p__acmdln", p_acmdln),
-    api!(ucrt, "__p___argv", p_argv),
-    api!(ucrt, "__p___argc", p_argc),
-    api!(ucrt, "getchar", getchar),
+/// Number of `_sys_errlist` entries (errno values 0..=42).
+pub(crate) const SYS_NERR: u32 = 43;
+
+/// UCRT strerror texts for errno 0..=42.
+const ERRLIST: [&str; 43] = [
+    "No error",
+    "Operation not permitted",
+    "No such file or directory",
+    "No such process",
+    "Interrupted function call",
+    "Input/output error",
+    "No such device or address",
+    "Arg list too long",
+    "Exec format error",
+    "Bad file descriptor",
+    "No child processes",
+    "Resource temporarily unavailable",
+    "Not enough space",
+    "Permission denied",
+    "Bad address",
+    "Unknown error",
+    "Resource device",
+    "File exists",
+    "Improper link",
+    "No such device",
+    "Not a directory",
+    "Is a directory",
+    "Invalid argument",
+    "Too many open files in system",
+    "Too many open files",
+    "Inappropriate I/O control operation",
+    "Unknown error",
+    "File too large",
+    "No space left on device",
+    "Invalid seek",
+    "Read-only file system",
+    "Too many links",
+    "Broken pipe",
+    "Domain error",
+    "Result too large",
+    "Unknown error",
+    "Resource deadlock avoided",
+    "Unknown error",
+    "Filename too long",
+    "No locks available",
+    "Function not implemented",
+    "Directory not empty",
+    "Illegal byte sequence",
 ];
 
-fn ok_zero(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, 0);
-    Ok(())
+/// Message for an errno value (out-of-range values give "Unknown error").
+pub(crate) fn strerror_text(e: i32) -> &'static str {
+    if (0..SYS_NERR as i32).contains(&e) {
+        ERRLIST[e as usize]
+    } else {
+        "Unknown error"
+    }
 }
 
-fn puts(ctx: &mut ApiCtx) -> Result<()> {
-    let s = read_cstr(ctx, arg(ctx.state, 0), 1 << 20);
-    write_stdout(&s);
-    write_stdout(b"\n");
-    ret(ctx.state, 0);
-    Ok(())
+/// CRT process state.
+#[derive(Default)]
+pub(crate) struct CrtState {
+    /// `atexit` handlers in registration order (run in reverse).
+    pub atexit: Vec<u64>,
+    /// Signal handlers by signal number.
+    pub signals: BTreeMap<i32, u64>,
+    /// Invalid-parameter handler (0 = none).
+    pub invalid_param: u64,
+    /// `__setusermatherr` handler (0 = none).
+    pub matherr: u64,
+    /// `_set_new_mode` value.
+    pub new_mode: u32,
+    /// `_set_app_type` value.
+    pub app_type: u32,
+    /// Environment block cache: `(env version, array address)`.
+    pub env_cache: Option<(u64, u64)>,
 }
 
-fn putchar(ctx: &mut ApiCtx) -> Result<()> {
-    let c = arg(ctx.state, 0) as u8;
-    write_stdout(&[c]);
-    ret(ctx.state, c as u64);
-    Ok(())
+/// `_fmode` (guest int).
+pub(crate) fn fmode(ctx: &mut ApiCtx) -> Result<u32> {
+    let a = var_fmode(ctx)?;
+    Ok(ctx.rd(a, 4)? as u32)
 }
 
-fn getchar(ctx: &mut ApiCtx) -> Result<()> {
-    use std::io::Read;
-    let mut b = [0u8; 1];
-    let n = std::io::stdin().lock().read(&mut b).unwrap_or(0);
-    ret(ctx.state, if n == 0 { u64::MAX } else { b[0] as u64 });
-    Ok(())
+/// Address of `_fmode`.
+pub(crate) fn var_fmode(ctx: &mut ApiCtx) -> Result<u64> {
+    Ok(ctx.p.statics.var("_fmode", 16)?.0)
 }
 
-fn exit_(ctx: &mut ApiCtx, code: u64) {
-    ctx.state.exit_code = code;
-    ctx.state.exit_reason = a64x_core::ExitReason::Exited as u8;
-    ctx.state.running = 0;
+/// Address of `_commode`.
+pub(crate) fn var_commode(ctx: &mut ApiCtx) -> Result<u64> {
+    Ok(ctx.p.statics.var("_commode", 16)?.0)
 }
 
-fn exit(ctx: &mut ApiCtx) -> Result<()> {
-    exit_(ctx, arg(ctx.state, 0));
-    Ok(())
+/// Build (once) the guest `argc`/`argv` variables from the command line.
+/// Returns `(argc address, argv address)`.
+pub(crate) fn ensure_args(ctx: &mut ApiCtx) -> Result<(u64, u64)> {
+    let (argc_a, first) = ctx.p.statics.var("__argc", 16)?;
+    let (argv_a, _) = ctx.p.statics.var("__argv", 16)?;
+    if first {
+        let args = shell32::parse_command_line(&ctx.cmd_line);
+        let mut ptrs = Vec::with_capacity(args.len() + 1);
+        for a in &args {
+            ptrs.push(ctx.intern_cstr(a)?);
+        }
+        ptrs.push(0);
+        let arr = ctx.p.statics.alloc(8 * ptrs.len() as u64, 16)?;
+        for (i, p) in ptrs.iter().enumerate() {
+            ctx.wr(arr + 8 * i as u64, 8, *p)?;
+        }
+        ctx.wr(argc_a, 4, args.len() as u64)?;
+        ctx.wr(argv_a, 8, arr)?;
+    }
+    Ok((argc_a, argv_a))
 }
 
-fn abort(ctx: &mut ApiCtx) -> Result<()> {
-    exit_(ctx, 134);
-    Ok(())
+/// Guest `char**` environment array, rebuilt when the environment changed.
+fn environ_var(ctx: &mut ApiCtx) -> Result<u64> {
+    let (cell, _) = ctx.p.statics.var("_environ", 16)?;
+    let version = ctx.p.env.version;
+    let fresh = matches!(ctx.p.crt.env_cache, Some((v, _)) if v == version);
+    if !fresh {
+        let entries: Vec<String> = ctx.p.env.entries();
+        let mut ptrs = Vec::with_capacity(entries.len() + 1);
+        for e in &entries {
+            ptrs.push(ctx.intern_cstr(e.as_bytes())?);
+        }
+        ptrs.push(0);
+        let arr = ctx.p.statics.alloc(8 * ptrs.len() as u64, 16)?;
+        for (i, p) in ptrs.iter().enumerate() {
+            ctx.wr(arr + 8 * i as u64, 8, *p)?;
+        }
+        ctx.wr(cell, 8, arr)?;
+        ctx.p.crt.env_cache = Some((version, arr));
+    }
+    Ok(cell)
+}
+
+/// Address of the `_sys_nerr` variable (43).
+fn sys_nerr_var(ctx: &mut ApiCtx) -> Result<u64> {
+    let (a, first) = ctx.p.statics.var("_sys_nerr", 16)?;
+    if first {
+        ctx.wr(a, 4, SYS_NERR as u64)?;
+    }
+    Ok(a)
+}
+
+/// Address of the `_sys_errlist` array of `char*`.
+fn sys_errlist_var(ctx: &mut ApiCtx) -> Result<u64> {
+    let (a, first) = ctx.p.statics.var("_sys_errlist", 16 * 8)?;
+    if first {
+        for e in 0..SYS_NERR as usize {
+            let s = ctx.intern_cstr(ERRLIST[e].as_bytes())?;
+            ctx.wr(a + 8 * e as u64, 8, s)?;
+        }
+    }
+    Ok(a)
+}
+
+/// Heap allocation for the CRT (process heap), setting errno on failure.
+fn crt_alloc(ctx: &mut ApiCtx, size: u64, align: u64) -> Result<u64> {
+    let p = heap::alloc(ctx, 0, size.max(1), align, false)?;
+    if p == 0 {
+        ctx.set_errno(ENOMEM);
+    }
+    Ok(p)
 }
 
 fn malloc(ctx: &mut ApiCtx) -> Result<()> {
-    let size = arg(ctx.state, 0);
-    let addr = ctx.alloc_heap(size.max(1), 16);
-    ret(ctx.state, addr);
+    let p = crt_alloc(ctx, ctx.a(0), 16)?;
+    ctx.ret(p);
     Ok(())
 }
 
 fn calloc(ctx: &mut ApiCtx) -> Result<()> {
-    let n = arg(ctx.state, 0).max(1);
-    let sz = arg(ctx.state, 1).max(1);
-    let size = n.saturating_mul(sz);
-    let addr = ctx.alloc_heap(size, 16);
-    ctx.mem.zero(addr, size.min(1 << 24))?;
-    ret(ctx.state, addr);
+    let (n, sz) = (ctx.a(0), ctx.a(1));
+    let Some(total) = n.checked_mul(sz) else {
+        ctx.set_errno(ENOMEM);
+        ctx.ret(0);
+        return Ok(());
+    };
+    let p = heap::alloc(ctx, 0, total.max(1), 16, true)?;
+    if p == 0 {
+        ctx.set_errno(ENOMEM);
+    }
+    ctx.ret(p);
     Ok(())
 }
 
-fn realloc_crt(ctx: &mut ApiCtx) -> Result<()> {
-    let old = arg(ctx.state, 0);
-    let size = arg(ctx.state, 1).max(1);
-    if old == 0 {
-        let addr = ctx.alloc_heap(size, 16);
-        ret(ctx.state, addr);
+fn free(ctx: &mut ApiCtx) -> Result<()> {
+    let p = ctx.a(0);
+    if p != 0 {
+        heap::free(ctx, 0, p);
+    }
+    Ok(())
+}
+
+fn realloc(ctx: &mut ApiCtx) -> Result<()> {
+    let (p, n) = (ctx.a(0), ctx.a(1));
+    if p != 0 && n == 0 {
+        heap::free(ctx, 0, p);
+        ctx.ret(0);
         return Ok(());
     }
-    let new_addr = ctx.alloc_heap(size, 16);
-    let n = size.min(1 << 24);
-    let mut tmp = vec![0u8; n as usize];
-    let _ = ctx.mem.read(old, &mut tmp);
-    let _ = ctx.mem.write(new_addr, &tmp);
-    ret(ctx.state, new_addr);
+    let r = heap::realloc(ctx, 0, p, n, 16, false)?;
+    if r == 0 {
+        ctx.set_errno(ENOMEM);
+    }
+    ctx.ret(r);
     Ok(())
 }
 
-fn free(_ctx: &mut ApiCtx) -> Result<()> {
+fn aligned_malloc(ctx: &mut ApiCtx) -> Result<()> {
+    let (n, align) = (ctx.a(0), ctx.a(1));
+    if align == 0 || !align.is_power_of_two() {
+        ctx.set_errno(EINVAL);
+        ctx.ret(0);
+        return Ok(());
+    }
+    let p = crt_alloc(ctx, n, align)?;
+    ctx.ret(p);
     Ok(())
 }
 
-fn memset_(ctx: &mut ApiCtx) -> Result<()> {
-    let (dst, val, len) = (arg(ctx.state, 0), arg(ctx.state, 1) as u8, arg(ctx.state, 2));
-    let p = ctx.mem.slice_mut(dst, len)?;
-    p.fill(val);
-    ret(ctx.state, dst);
+fn aligned_free(ctx: &mut ApiCtx) -> Result<()> {
+    let p = ctx.a(0);
+    if p != 0 {
+        heap::free(ctx, 0, p);
+    }
     Ok(())
 }
 
-fn memcpy_(ctx: &mut ApiCtx) -> Result<()> {
-    let (dst, src, len) = (arg(ctx.state, 0), arg(ctx.state, 1), arg(ctx.state, 2));
-    let tmp = ctx.mem.slice(src, len)?.to_vec();
-    ctx.mem.write(dst, &tmp)?;
-    ret(ctx.state, dst);
+fn msize(ctx: &mut ApiCtx) -> Result<()> {
+    let p = ctx.a(0);
+    let n = heap::size_of(ctx, 0, p).unwrap_or(0);
+    ctx.ret(n);
     Ok(())
 }
 
-fn memmove_(ctx: &mut ApiCtx) -> Result<()> {
-    memcpy_(ctx)
-}
-
-fn memcmp_(ctx: &mut ApiCtx) -> Result<()> {
-    let (a, b, len) = (arg(ctx.state, 0), arg(ctx.state, 1), arg(ctx.state, 2));
-    let la = ctx.mem.slice(a, len)?.to_vec();
-    let lb = ctx.mem.slice(b, len)?.to_vec();
-    let d = la.iter().zip(lb.iter()).find(|(x, y)| x != y).map(|(x, y)| *x as i64 - *y as i64).unwrap_or(0);
-    ret(ctx.state, d as u64);
-    Ok(())
-}
-
-fn strlen_(ctx: &mut ApiCtx) -> Result<()> {
-    let s = read_cstr(ctx, arg(ctx.state, 0), 1 << 20);
-    ret(ctx.state, s.len() as u64);
-    Ok(())
-}
-
-fn strnlen_(ctx: &mut ApiCtx) -> Result<()> {
-    let max = arg(ctx.state, 1) as usize;
-    let s = read_cstr(ctx, arg(ctx.state, 0), max.min(1 << 20));
-    ret(ctx.state, s.len().min(max) as u64);
-    Ok(())
-}
-
-fn strcmp_(ctx: &mut ApiCtx) -> Result<()> {
-    let a = read_cstr(ctx, arg(ctx.state, 0), 1 << 20);
-    let b = read_cstr(ctx, arg(ctx.state, 1), 1 << 20);
-    let d = match a.cmp(&b) {
-        core::cmp::Ordering::Less => -1i64,
-        core::cmp::Ordering::Equal => 0,
-        core::cmp::Ordering::Greater => 1,
-    };
-    ret(ctx.state, d as u64);
-    Ok(())
-}
-
-fn strncmp_(ctx: &mut ApiCtx) -> Result<()> {
-    let n = arg(ctx.state, 2) as usize;
-    let a = read_cstr(ctx, arg(ctx.state, 0), n + 1);
-    let b = read_cstr(ctx, arg(ctx.state, 1), n + 1);
-    let (a, b) = (&a[..a.len().min(n)], &b[..b.len().min(n)]);
-    let d = match a.cmp(b) {
-        core::cmp::Ordering::Less => -1i64,
-        core::cmp::Ordering::Equal => 0,
-        core::cmp::Ordering::Greater => 1,
-    };
-    ret(ctx.state, d as u64);
-    Ok(())
-}
-
-fn stricmp_(ctx: &mut ApiCtx) -> Result<()> {
-    let a: Vec<u8> = read_cstr(ctx, arg(ctx.state, 0), 1 << 20).iter().map(u8::to_ascii_lowercase).collect();
-    let b: Vec<u8> = read_cstr(ctx, arg(ctx.state, 1), 1 << 20).iter().map(u8::to_ascii_lowercase).collect();
-    let d = match a.cmp(&b) {
-        core::cmp::Ordering::Less => -1i64,
-        core::cmp::Ordering::Equal => 0,
-        core::cmp::Ordering::Greater => 1,
-    };
-    ret(ctx.state, d as u64);
-    Ok(())
-}
-
-fn strcpy_(ctx: &mut ApiCtx) -> Result<()> {
-    let (dst, src) = (arg(ctx.state, 0), arg(ctx.state, 1));
-    let s = read_cstr(ctx, src, 1 << 20);
-    ctx.mem.write_cstr(dst, &s)?;
-    ret(ctx.state, dst);
-    Ok(())
-}
-
-fn strncpy_(ctx: &mut ApiCtx) -> Result<()> {
-    let (dst, src, n) = (arg(ctx.state, 0), arg(ctx.state, 1), arg(ctx.state, 2) as usize);
-    let mut s = read_cstr(ctx, src, n + 1);
-    s.truncate(n);
-    s.resize(n, 0);
-    ctx.mem.write(dst, &s)?;
-    ret(ctx.state, dst);
-    Ok(())
-}
-
-fn strdup_(ctx: &mut ApiCtx) -> Result<()> {
-    let s = read_cstr(ctx, arg(ctx.state, 0), 1 << 20);
-    let addr = ctx.alloc_heap(s.len() as u64 + 1, 1);
-    ctx.mem.write_cstr(addr, &s)?;
-    ret(ctx.state, addr);
-    Ok(())
-}
-
-fn tolower_(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, (arg(ctx.state, 0) as u8 as char).to_ascii_lowercase() as u64);
-    Ok(())
-}
-fn toupper_(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, (arg(ctx.state, 0) as u8 as char).to_ascii_uppercase() as u64);
-    Ok(())
-}
-fn isspace_(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, (arg(ctx.state, 0) as u8 as char).is_ascii_whitespace() as u64);
-    Ok(())
-}
-fn isdigit_(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, (arg(ctx.state, 0) as u8 as char).is_ascii_digit() as u64);
-    Ok(())
-}
-fn isalpha_(ctx: &mut ApiCtx) -> Result<()> {
-    ret(ctx.state, (arg(ctx.state, 0) as u8 as char).is_ascii_alphabetic() as u64);
-    Ok(())
-}
-
-fn atoi(ctx: &mut ApiCtx) -> Result<()> {
-    let s = read_cstr(ctx, arg(ctx.state, 0), 1 << 16);
-    let text = String::from_utf8_lossy(&s);
-    let v: i64 = text.trim().parse().unwrap_or_else(|_| {
-        // partial parse: leading digits with sign
-        let t = text.trim_start();
-        let (sign, t) = match t.strip_prefix('-') {
-            Some(r) => (-1i64, r),
-            None => (1, t.strip_prefix('+').unwrap_or(t)),
-        };
-        let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-        sign * digits.parse::<i64>().unwrap_or(0)
-    });
-    ret(ctx.state, v as u64);
-    Ok(())
-}
-
-fn abs_(ctx: &mut ApiCtx) -> Result<()> {
-    let v = arg(ctx.state, 0) as i32;
-    ret(ctx.state, (v as i64).unsigned_abs());
-    Ok(())
-}
-
-fn acrt_iob_func(ctx: &mut ApiCtx) -> Result<()> {
-    // fake FILE* for stdin/stdout/stderr
-    let fd = arg(ctx.state, 0).min(2);
-    ret(ctx.state, win_shared::H_STDIN + fd);
-    Ok(())
-}
-
-fn p_acmdln(ctx: &mut ApiCtx) -> Result<()> {
-    // char** pointing to the command line string
-    let slot = win_shared::STRINGS_BASE + 0x100;
-    ctx.mem.write_int(slot, 8, win_shared::STRINGS_BASE)?;
-    ret(ctx.state, slot);
-    Ok(())
-}
-
-fn p_argv(ctx: &mut ApiCtx) -> Result<()> {
-    let base = win_shared::STRINGS_BASE + 0x200;
-    ctx.mem.write_int(base, 8, win_shared::STRINGS_BASE)?; // argv[0]
-    ctx.mem.write_int(base + 8, 8, 0)?; // terminator
-    ret(ctx.state, base);
+fn set_new_mode(ctx: &mut ApiCtx) -> Result<()> {
+    let m = ctx.au(0);
+    if m > 1 {
+        ctx.set_errno(EINVAL);
+        ctx.ret(u64::MAX);
+        return Ok(());
+    }
+    let prev = ctx.p.crt.new_mode;
+    ctx.p.crt.new_mode = m;
+    ctx.ret(prev as u64);
     Ok(())
 }
 
 fn p_argc(ctx: &mut ApiCtx) -> Result<()> {
-    let slot = win_shared::STRINGS_BASE + 0x300;
-    ctx.mem.write_int(slot, 4, 1)?;
-    ret(ctx.state, slot);
+    let (a, _) = ensure_args(ctx)?;
+    ctx.ret(a);
     Ok(())
 }
 
-fn get_initial_narrow_env(ctx: &mut ApiCtx) -> Result<()> {
-    let base = win_shared::STRINGS_BASE + 0x400;
-    ctx.mem.write_int(base, 8, 0)?; // empty env: {NULL}
-    ret(ctx.state, base);
+fn p_argv(ctx: &mut ApiCtx) -> Result<()> {
+    let (_, a) = ensure_args(ctx)?;
+    ctx.ret(a);
     Ok(())
 }
 
-fn seh_filter_exe(ctx: &mut ApiCtx) -> Result<()> {
-    let code = arg(ctx.state, 0);
-    ret(ctx.state, 1); // EXCEPTION_EXECUTE_HANDLER-ish
-    ctx.exit_message = Some(format!("SEH filter invoked, code {code:#x}"));
+fn p_environ(ctx: &mut ApiCtx) -> Result<()> {
+    let a = environ_var(ctx)?;
+    ctx.ret(a);
     Ok(())
 }
 
-// -----------------------------------------------------------------------
-// printf family
-// -----------------------------------------------------------------------
+fn getenv(ctx: &mut ApiCtx) -> Result<()> {
+    let name = ctx.cstr_string(ctx.a(0))?;
+    let value = ctx.p.env.get(&name).map(|v| v.to_string());
+    match value {
+        Some(v) => {
+            let p = ctx.intern_cstr(v.as_bytes())?;
+            ctx.ret(p);
+        }
+        None => ctx.ret(0),
+    }
+    Ok(())
+}
 
-/// Fetch vararg #k (0-based): registers x1..x7 hold the first 7 varargs
-/// (x0 is the format), beyond that the guest stack carries them.
-fn vararg(ctx: &ApiCtx, k: usize) -> u64 {
-    if k + 1 < 8 {
-        ctx.state.x[k + 1]
+fn putenv_s(ctx: &mut ApiCtx) -> Result<()> {
+    let name = ctx.cstr_string(ctx.a(0))?;
+    let value_p = ctx.a(1);
+    if name.is_empty() || name.contains('=') {
+        ctx.set_errno(EINVAL);
+        ctx.ret_i32(EINVAL);
+        return Ok(());
+    }
+    let value = if value_p == 0 {
+        None
     } else {
-        let addr = ctx.state.sp + 8 * (k as u64 + 1 - 8);
-        ctx.mem.read_int(addr, 8).unwrap_or(0)
-    }
-}
-
-/// Minimal C-format walker: %s %d %i %u %x %X %c %p %ld %lu %lld %llu %%.
-fn format_into(ctx: &ApiCtx, fmt_addr: u64, mut next: impl FnMut(&ApiCtx) -> u64) -> String {
-    let fmt = read_cstr(ctx, fmt_addr, 1 << 20);
-    let text = String::from_utf8_lossy(&fmt).into_owned();
-    let mut out = String::with_capacity(text.len() + 32);
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= bytes.len() {
-            break;
-        }
-        // flags / width — consume and largely ignore (padding lgtm later)
-        let mut width = String::new();
-        let mut longs = 0;
-        let mut plus = false;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'+' => {
-                    plus = true;
-                    i += 1;
-                }
-                b'-' | b'0' | b' ' | b'#' => {
-                    i += 1;
-                }
-                b'0'..=b'9' => {
-                    width.push(bytes[i] as char);
-                    i += 1;
-                }
-                b'.' => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                }
-                b'l' => {
-                    longs += 1;
-                    i += 1;
-                }
-                b'z' | b'h' | b'I' => {
-                    if bytes[i] == b'I' && bytes.get(i + 1..i + 3) == Some(b"64") {
-                        i += 3;
-                        longs = 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                _ => break,
-            }
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let w: usize = width.parse().unwrap_or(0);
-        let spec = bytes[i];
-        i += 1;
-        let pad = |s: String, w: usize| -> String {
-            if s.len() < w {
-                format!("{:>width$}", s, width = w)
-            } else {
-                s
-            }
-        };
-        match spec {
-            b'%' => out.push('%'),
-            b'c' => {
-                let v = next(ctx) as u8;
-                out.push(v as char);
-            }
-            b's' => {
-                let addr = next(ctx);
-                let s = read_cstr(ctx, addr, 1 << 20);
-                out.push_str(&String::from_utf8_lossy(&s));
-            }
-            b'd' | b'i' => {
-                let v = next(ctx);
-                let s = if longs > 0 { format!("{}", v as i64) } else { format!("{}", v as u32 as i32) };
-                let s = if plus && !s.starts_with('-') { format!("+{s}") } else { s };
-                out.push_str(&pad(s, w));
-            }
-            b'u' => {
-                let v = next(ctx);
-                let s = if longs > 0 { format!("{v}") } else { format!("{}", v as u32) };
-                out.push_str(&pad(s, w));
-            }
-            b'x' => {
-                let v = next(ctx);
-                let s = if longs > 0 { format!("{v:x}") } else { format!("{:x}", v as u32) };
-                out.push_str(&pad(s, w));
-            }
-            b'X' => {
-                let v = next(ctx);
-                let s = if longs > 0 { format!("{v:X}") } else { format!("{:X}", v as u32) };
-                out.push_str(&pad(s, w));
-            }
-            b'p' => {
-                let v = next(ctx);
-                out.push_str(&format!("{v:#018X}"));
-            }
-            b'n' => {
-                let _ = next(ctx);
-            }
-            _ => {
-                out.push('%');
-                out.push(spec as char);
-            }
-        }
-    }
-    out
-}
-
-fn printf(ctx: &mut ApiCtx) -> Result<()> {
-    let mut k = 0usize;
-    let s = format_into(ctx, arg(ctx.state, 0), |c| {
-        let v = vararg(c, k);
-        k += 1;
-        v
-    });
-    write_stdout(s.as_bytes());
-    ret(ctx.state, s.len() as u64);
+        Some(ctx.cstr_string(value_p)?)
+    };
+    ctx.p.env.set(&name, value.as_deref());
+    ctx.ret_i32(0);
     Ok(())
 }
 
-fn fprintf(ctx: &mut ApiCtx) -> Result<()> {
-    let stream = arg(ctx.state, 0);
-    let mut k = 0usize;
-    let s = format_into(ctx, arg(ctx.state, 1), |c| {
-        let v = vararg(c, k + 1);
-        k += 1;
-        v
-    });
-    if stream == win_shared::H_STDERR {
-        crate::write_stderr(s.as_bytes());
+fn errno_addr(ctx: &mut ApiCtx) -> Result<()> {
+    let a = ctx.p.sched.cur_errno_addr();
+    ctx.ret(a);
+    Ok(())
+}
+
+fn initterm(ctx: &mut ApiCtx) -> Result<()> {
+    let lr = ctx.state.x[30];
+    cont::init_term_step(ctx, lr, ctx.a(0), ctx.a(1), false)
+}
+
+fn initterm_e(ctx: &mut ApiCtx) -> Result<()> {
+    let lr = ctx.state.x[30];
+    cont::init_term_step(ctx, lr, ctx.a(0), ctx.a(1), true)
+}
+
+fn exit(ctx: &mut ApiCtx) -> Result<()> {
+    let code = ctx.au(0) as u64;
+    let n = ctx.p.crt.atexit.len();
+    cont::run_atexit(ctx, n, AtexitEnd::Terminate(code))
+}
+
+fn cexit(ctx: &mut ApiCtx) -> Result<()> {
+    let lr = ctx.state.x[30];
+    let n = ctx.p.crt.atexit.len();
+    cont::run_atexit(ctx, n, AtexitEnd::Return { lr, value: 0 })
+}
+
+fn exit_process_crt(ctx: &mut ApiCtx) -> Result<()> {
+    let code = ctx.au(0) as u64;
+    cont::finish_process(ctx, code);
+    Ok(())
+}
+
+/// `abort`: run the SIGABRT handler (reset to default first) and exit with 3.
+fn abort(ctx: &mut ApiCtx) -> Result<()> {
+    let h = ctx.p.crt.signals.get(&SIGABRT).copied().unwrap_or(SIG_DFL);
+    if h == SIG_DFL || h == 1 || h == SIG_ERR {
+        cont::finish_process(ctx, 3);
+        return Ok(());
+    }
+    ctx.p.crt.signals.insert(SIGABRT, SIG_DFL);
+    cont::call_guest(ctx, h, &[SIGABRT as u64], cont::Frame::Abort);
+    Ok(())
+}
+
+fn signal(ctx: &mut ApiCtx) -> Result<()> {
+    let sig = ctx.ai(0);
+    let func = ctx.a(1);
+    if !VALID_SIGNALS.contains(&sig) {
+        ctx.set_errno(EINVAL);
+        ctx.ret(SIG_ERR);
+        return Ok(());
+    }
+    let prev = ctx.p.crt.signals.insert(sig, func).unwrap_or(SIG_DFL);
+    ctx.ret(prev);
+    Ok(())
+}
+
+fn atexit(ctx: &mut ApiCtx) -> Result<()> {
+    let f = ctx.a(0);
+    if f == 0 {
+        ctx.set_errno(EINVAL);
+        ctx.ret_i32(-1);
+        return Ok(());
+    }
+    ctx.p.crt.atexit.push(f);
+    ctx.ret_i32(0);
+    Ok(())
+}
+
+fn set_invalid_parameter_handler(ctx: &mut ApiCtx) -> Result<()> {
+    let new = ctx.a(0);
+    let prev = std::mem::replace(&mut ctx.p.crt.invalid_param, new);
+    ctx.ret(prev);
+    Ok(())
+}
+
+fn set_app_type(ctx: &mut ApiCtx) -> Result<()> {
+    ctx.p.crt.app_type = ctx.au(0);
+    Ok(())
+}
+
+fn fpreset(ctx: &mut ApiCtx) -> Result<()> {
+    ctx.state.fpcr = 0;
+    ctx.state.fpsr = 0;
+    Ok(())
+}
+
+fn configure_narrow_argv(ctx: &mut ApiCtx) -> Result<()> {
+    ctx.ret_i32(0);
+    Ok(())
+}
+
+fn initialize_narrow_environment(ctx: &mut ApiCtx) -> Result<()> {
+    ctx.ret_i32(0);
+    Ok(())
+}
+
+/// `_assert(message, file, line)`: report on stderr, then abort.
+fn assert_fail(ctx: &mut ApiCtx) -> Result<()> {
+    let msg = ctx.cstr_string(ctx.a(0))?;
+    let file = ctx.cstr_string(ctx.a(1))?;
+    let line = ctx.au(2);
+    let text = format!("Assertion failed: {msg}, file {file}, line {line}\n");
+    {
+        use std::io::Write;
+        let mut e = std::io::stderr().lock();
+        let _ = e.write_all(text.as_bytes());
+        let _ = e.flush();
+    }
+    abort(ctx)
+}
+
+fn strerror(ctx: &mut ApiCtx) -> Result<()> {
+    let e = ctx.ai(0);
+    let p = ctx.intern_cstr(strerror_text(e).as_bytes())?;
+    ctx.ret(p);
+    Ok(())
+}
+
+/// An invalid parameter was passed to a CRT function: the registered
+/// invalid-parameter handler is called with the function name, and the
+/// function then returns `ret`. Without a handler the process terminates
+/// with the UCRT fast-fail status (STATUS_STACK_BUFFER_OVERRUN class).
+pub(crate) fn invalid_parameter(ctx: &mut ApiCtx, func: &str, ret: u64) -> Result<()> {
+    let handler = ctx.p.crt.invalid_param;
+    if handler == 0 {
+        ctx.exit_message = Some(format!("invalid parameter passed to {func}"));
+        cont::finish_process(ctx, FAST_FAIL_INVALID_PARAMETER);
+        return Ok(());
+    }
+    let units: Vec<u16> = func.encode_utf16().collect();
+    let name = ctx.intern_wstr(&units)?;
+    let lr = ctx.state.x[30];
+    cont::call_guest(ctx, handler, &[0, name, 0, 0, 0], cont::Frame::InvalidParam { lr, ret });
+    Ok(())
+}
+
+fn strerror_s(ctx: &mut ApiCtx) -> Result<()> {
+    let (buf, size, e) = (ctx.a(0), ctx.a(1), ctx.ai(2));
+    if buf == 0 || size == 0 {
+        ctx.set_errno(EINVAL);
+        return invalid_parameter(ctx, "strerror_s", EINVAL as u64);
+    }
+    let text = strerror_text(e).as_bytes();
+    let fit = (size - 1).min(text.len() as u64);
+    ctx.put(buf, &text[..fit as usize])?;
+    ctx.wr(buf + fit, 1, 0)?;
+    if fit < text.len() as u64 {
+        ctx.ret_i32(ERANGE);
     } else {
-        write_stdout(s.as_bytes());
+        ctx.ret_i32(0);
     }
-    ret(ctx.state, s.len() as u64);
     Ok(())
 }
 
-/// UCRT `__stdio_common_vfprintf(options, stream, fmt, locale, args)`.
-/// On Windows/ARM64 `va_list` is simply a pointer into the stack argument
-/// area; consume 64-bit slots from it.
-fn stdio_common_vfprintf(ctx: &mut ApiCtx) -> Result<()> {
-    let (_options, stream, fmt, _locale, mut args) =
-        (arg(ctx.state, 0), arg(ctx.state, 1), arg(ctx.state, 2), arg(ctx.state, 3), arg(ctx.state, 4));
-    let out = format_into(ctx, fmt, |c| {
-        let v = c.mem.read_int(args, 8).unwrap_or(0);
-        args += 8;
-        v
-    });
-    if stream == win_shared::H_STDERR {
-        crate::write_stderr(out.as_bytes());
-    } else {
-        write_stdout(out.as_bytes());
-    }
-    ret(ctx.state, out.len() as u64);
+fn sys_nerr(ctx: &mut ApiCtx) -> Result<()> {
+    let a = sys_nerr_var(ctx)?;
+    ctx.ret(a);
     Ok(())
+}
+
+fn sys_errlist(ctx: &mut ApiCtx) -> Result<()> {
+    let a = sys_errlist_var(ctx)?;
+    ctx.ret(a);
+    Ok(())
+}
+
+/// `_beginthreadex(security, stack, start, arg, initflag, thrdaddr)`.
+fn beginthreadex(ctx: &mut ApiCtx) -> Result<()> {
+    let (stack, start, arg, flags, out) = (ctx.a(1), ctx.a(2), ctx.a(3), ctx.au(4), ctx.a(5));
+    let h = sched::spawn(ctx, start, arg, stack, flags & 4 != 0)?;
+    if h == 0 {
+        ctx.set_errno(EAGAIN);
+        ctx.ret(0);
+        return Ok(());
+    }
+    if out != 0 {
+        let tid = ctx.p.sched.threads.last().map(|t| t.tid).unwrap_or(0);
+        ctx.wr(out, 4, tid as u64)?;
+    }
+    ctx.ret(h);
+    Ok(())
+}
+
+fn endthreadex(ctx: &mut ApiCtx) -> Result<()> {
+    let code = ctx.au(0) as u64;
+    cont::exit_thread(ctx, code)
+}
+
+/// `_lock_file(FILE*)`: recursive per-stream lock; blocks while another
+/// thread holds it.
+fn lock_file(ctx: &mut ApiCtx) -> Result<()> {
+    let _ = sched::take_wait(ctx);
+    let stream = ctx.a(0);
+    let me = ctx.p.sched.cur_tid();
+    let owner = ctx
+        .p
+        .stdio
+        .streams
+        .get(&stream)
+        .map(|s| s.lock_owner)
+        .unwrap_or(0);
+    if owner != 0 && owner != me {
+        ctx.block_retry(None);
+        return Ok(());
+    }
+    if let Some(s) = ctx.p.stdio.streams.get_mut(&stream) {
+        s.lock_owner = me;
+        s.lock_count += 1;
+    }
+    Ok(())
+}
+
+fn unlock_file(ctx: &mut ApiCtx) -> Result<()> {
+    let stream = ctx.a(0);
+    let me = ctx.p.sched.cur_tid();
+    let mut released = false;
+    if let Some(s) = ctx.p.stdio.streams.get_mut(&stream) {
+        if s.lock_owner == me && s.lock_count > 0 {
+            s.lock_count -= 1;
+            if s.lock_count == 0 {
+                s.lock_owner = 0;
+                released = true;
+            }
+        }
+    }
+    if released {
+        sched::notify(ctx);
+    }
+    Ok(())
+}
+
+/// `rand_s(unsigned int* randomValue)`: 32 bits from the host CSPRNG-seeded
+/// hash state (std's RandomState is seeded from the operating system).
+fn rand_s(ctx: &mut ApiCtx) -> Result<()> {
+    use std::hash::{BuildHasher, Hasher};
+    let out = ctx.a(0);
+    if out == 0 {
+        ctx.ret_i32(EINVAL);
+        return Ok(());
+    }
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(ctx.state.insn_count);
+    let v = h.finish() as u32;
+    ctx.wr(out, 4, v as u64)?;
+    ctx.ret_i32(0);
+    Ok(())
+}
+
+pub(crate) fn register(v: &mut Vec<ApiDef>) {
+    reg!(v, "ucrtbase",
+        "_initialize_narrow_environment" => initialize_narrow_environment,
+        "malloc" => malloc,
+        "calloc" => calloc,
+        "free" => free,
+        "realloc" => realloc,
+        "_aligned_malloc" => aligned_malloc,
+        "_aligned_free" => aligned_free,
+        "_msize" => msize,
+        "_set_new_mode" => set_new_mode,
+        "__p___argc" => p_argc,
+        "__p___argv" => p_argv,
+        "__p__environ" => p_environ,
+        "getenv" => getenv,
+        "_putenv_s" => putenv_s,
+        "_errno" => errno_addr,
+        "_initterm" => initterm,
+        "_initterm_e" => initterm_e,
+        "exit" => exit,
+        "_cexit" => cexit,
+        "_exit" => exit_process_crt,
+        "abort" => abort,
+        "signal" => signal,
+        "_crt_atexit" => atexit,
+        "atexit" => atexit,
+        "_set_invalid_parameter_handler" => set_invalid_parameter_handler,
+        "_set_app_type" => set_app_type,
+        "_fpreset" => fpreset,
+        "_configure_narrow_argv" => configure_narrow_argv,
+        "_assert" => assert_fail,
+        "strerror" => strerror,
+        "strerror_s" => strerror_s,
+        "__sys_nerr" => sys_nerr,
+        "__sys_errlist" => sys_errlist,
+        "_beginthreadex" => beginthreadex,
+        "_endthreadex" => endthreadex,
+        "_lock_file" => lock_file,
+        "_unlock_file" => unlock_file,
+        "rand_s" => rand_s,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strerror_table_matches_ucrt_entries() {
+        assert_eq!(strerror_text(0), "No error");
+        assert_eq!(strerror_text(2), "No such file or directory");
+        assert_eq!(strerror_text(15), "Unknown error");
+        assert_eq!(strerror_text(42), "Illegal byte sequence");
+        assert_eq!(strerror_text(43), "Unknown error");
+        assert_eq!(strerror_text(-1), "Unknown error");
+        assert_eq!(ERRLIST.len() as u32, SYS_NERR);
+    }
 }

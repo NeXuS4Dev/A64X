@@ -15,7 +15,7 @@ pub mod demo;
 pub mod dispatch;
 pub mod loader;
 
-pub use dispatch::{run, RunOutcome};
+pub use dispatch::{run, run_with, RunConfig, RunOutcome};
 pub use loader::{load, validate, BoundImport, LoadedImage};
 
 use a64x_api::ApiLayer;
@@ -36,40 +36,64 @@ pub struct Guest {
 impl Guest {
     /// Load `pe_bytes` into fresh guest memory at the default image base.
     pub fn load(pe_bytes: &[u8], cfg: XlatConfig) -> Result<Guest> {
-        Guest::load_at(pe_bytes, a64x_core::memory::DEFAULT_IMAGE_BASE, cfg, a64x_core::GUEST_DEFAULT_SIZE)
+        Guest::load_at(
+            pe_bytes,
+            a64x_core::memory::DEFAULT_IMAGE_BASE,
+            cfg,
+            a64x_core::GUEST_DEFAULT_SIZE,
+        )
     }
 
     /// Load `pe_bytes` at an explicit base/size.
-    pub fn load_at(pe_bytes: &[u8], image_base: u64, cfg: XlatConfig, mem_size: u64) -> Result<Guest> {
+    pub fn load_at(
+        pe_bytes: &[u8],
+        image_base: u64,
+        cfg: XlatConfig,
+        mem_size: u64,
+    ) -> Result<Guest> {
         let pe = PeImage::parse(pe_bytes)?;
         let mem = Memory::new(mem_size)?;
         let mut machine = Machine::new(mem, cfg)?;
         let api = ApiLayer::new();
         let image = load(&mut machine.mem, &pe, pe_bytes, image_base, &api)?;
-        Ok(Guest { machine, api, image })
+        Ok(Guest {
+            machine,
+            api,
+            image,
+        })
+    }
+
+    /// Name the image in its module description (GetModuleFileName, module
+    /// handles). `path` is the Windows path or bare file name of the program.
+    pub fn with_path(mut self, path: &str) -> Guest {
+        self.image.module.path = path.to_string();
+        self
     }
 
     /// Run the loaded image to completion, marshaling API calls.
     pub fn run(&mut self) -> RunOutcome {
-        self.run_with(false)
+        self.run_inner(&[], false)
     }
 
     /// Run with per-round tracing.
     pub fn run_traced(&mut self) -> RunOutcome {
-        self.run_with(true)
+        self.run_inner(&[], true)
     }
 
-    fn run_with(&mut self, trace: bool) -> RunOutcome {
-        let entry = self.image.entry;
-        let image_base = self.image.image_base;
-        dispatch::run(&mut self.machine, &self.api, entry, &[], image_base, trace)
-    }
-
-    /// Convenience: set the guest command line string (available to the
-    /// program via GetCommandLineA-style adapters).
+    /// Run with `args` as the guest command line (GetCommandLineA/W, argv).
     pub fn run_with_args(&mut self, args: &[u8]) -> RunOutcome {
-        let entry = self.image.entry;
-        let image_base = self.image.image_base;
-        dispatch::run(&mut self.machine, &self.api, entry, args, image_base, false)
+        self.run_inner(args, false)
+    }
+
+    fn run_inner(&mut self, cmdline: &[u8], trace: bool) -> RunOutcome {
+        let modules = [self.image.module.clone()];
+        let cfg = RunConfig {
+            entry: self.image.entry,
+            cmdline,
+            image_base: self.image.image_base,
+            modules: &modules,
+            trace,
+        };
+        dispatch::run_with(&mut self.machine, &self.api, &cfg)
     }
 }

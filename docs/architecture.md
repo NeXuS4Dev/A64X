@@ -80,19 +80,40 @@ a host crash).
 
 ## API translation
 
-Guest imports bind to `GATEWAY_BASE + 16*id`. `blr` there exits
-translation; the dispatcher maps the stub address back to an adapter id
-and invokes the Rust function with an `ApiCtx { state, mem, cmd_line,
-image_base, api }`. Adapters model Win32 semantics portably:
+Guest imports bind to `GATEWAY_BASE + 16*id`. A `blr` there exits translated
+code; the dispatcher maps the gateway address back to an adapter and invokes
+it with an `ApiCtx` (CPU state, guest memory, process state, loaded modules).
+Imports are resolved per API set (`api-ms-win-crt-*` and `ucrtbase` are one
+host, `kernel32` hosts the `api-ms-win-core-*` family, and so on; see
+`docs/api-surface.md`).
 
-- console via stdout/stderr handles,
-- `CreateFile/ReadFile/WriteFile` with real `std::fs` handles,
-- process heap bump allocator inside guest memory,
-- command line, exit codes, GetLastError state in `CpuState`,
-- CRT (`printf` with real varargs parsing, `malloc`, `strcmp`, …).
+The `a64x-api` crate is organised around the process state:
 
-On Windows hosts the same registry binds the *real* DLL exports with the
-same marshaling ABI (`WIN32` cfg paths in `a64x-api`).
+- **Scheduler** (`sched.rs`): green threads with saved CPU states, preemption
+  at translator round boundaries, and blocking calls that re-run their adapter
+  when a synchronization object changes or a deadline passes. Deadlock is
+  detected when no thread can run.
+- **Continuations** (`cont.rs`): adapters that must run guest code (initializer
+  tables, `atexit`, thread start routines, SEH filters and `finally` blocks)
+  push a frame and return; the internal `__continue` gateway resumes the
+  original call when the guest function returns.
+- **Memory** (`heap.rs`, `vm.rs`): a first-fit heap with coalescing, and a
+  page-granular VM map with reserve/commit/protect/query semantics.
+- **Handles** (`handles.rs`): shareable kernel objects (files, events, mutexes,
+  semaphores, threads, mappings, heaps, directory enumerations).
+- **Unwinding** (`unwind.rs`, `k32_seh.rs`): ARM64 `.pdata`/`.xdata` unwinding
+  and the two-phase structured-exception walk.
+- **Engines** (`format.rs`, `scan.rs`, `convert.rs`, `timefmt.rs`): printf,
+  scanf, numeric and multibyte conversion, and strftime with UCRT semantics.
+
+The loader gives the API layer a `ModuleInfo` for each image (sections,
+exception directory, exports), used by unwinding, module handles and
+`GetProcAddress`.
+
+Win32 is modelled portably on the host: the console goes through the host's
+stdout/stderr, files through `std::fs`, time through the host clock. Protection
+and mapping semantics, the locale, and several query APIs have explicit
+limits; they are listed in `docs/api-surface.md`.
 
 ## Instruction coverage (current)
 

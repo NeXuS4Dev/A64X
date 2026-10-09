@@ -102,6 +102,16 @@ pub struct CpuState {
     /// Scratch: diagnostic info for the current exit reason
     /// (e.g. instruction word, faulting address, SVC number).
     pub aux: [u64; 4],
+    /// SIMD&FP registers v0..=v31 as `[low, high]` 64-bit halves.
+    ///
+    /// Appended after the translator-visible fields so their offsets stay
+    /// stable. Adapters use these for double/float arguments and results
+    /// (d0/s0 are the low bits of v0).
+    pub v: [[u64; 2]; 32],
+    /// Floating-point control register (FPCR).
+    pub fpcr: u32,
+    /// Floating-point status register (FPSR).
+    pub fpsr: u32,
 }
 
 impl Default for CpuState {
@@ -122,6 +132,9 @@ impl Default for CpuState {
             exit_code: 0,
             last_error: 0,
             aux: [0; 4],
+            v: [[0; 2]; 32],
+            fpcr: 0,
+            fpsr: 0,
         }
     }
 }
@@ -209,6 +222,7 @@ mod tests {
         assert_eq!(offset_of!(CpuState, budget) % 8, 0);
         assert!(offset_of!(CpuState, mem_base) % 8 == 0);
         assert!(core::mem::size_of::<CpuState>() % 8 == 0);
+        assert!(offset_of!(CpuState, v) >= offset_of!(CpuState, aux));
     }
 
     #[test]
