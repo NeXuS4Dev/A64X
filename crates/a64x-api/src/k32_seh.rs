@@ -279,9 +279,12 @@ pub(crate) fn walk(ctx: &mut ApiCtx, op: Op) -> Result<()> {
             );
             return Ok(());
         }
-        // no handler: continue with the caller, or stop at the edge of the known code
+        // no handler: continue with the caller, or stop when unwinding cannot
+        // make progress (a frame without unwind data whose return address is
+        // its own PC, as Windows rejects) or leaves the known code
+        let no_progress = caller.pc == regs.pc && caller.sp == regs.sp;
         copy_context(ctx, op.ctx2, op.ctx)?;
-        if caller.pc == 0 || !unwind_is_known(ctx, caller.pc) {
+        if caller.pc == 0 || no_progress || !unwind_is_known(ctx, caller.pc) {
             return end_of_stack(ctx, &op);
         }
     }

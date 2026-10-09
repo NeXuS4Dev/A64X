@@ -788,6 +788,44 @@ mod tests {
     }
 
     #[test]
+    fn full_xdata_prologue_unwinds_to_the_caller() {
+        // stp x29, x30, [sp, #-48]! ; mov x29, sp ; sub sp, sp, #16 ; <body>
+        let mut m = Memory::new(0x100_0000).expect("memory");
+        let base = 0x40_0000u64;
+        let pdata = 0x20_0000u64;
+        // RUNTIME_FUNCTION { begin 0x1000, unwind 0x2000 }
+        m.write_int(pdata, 4, 0x1000).unwrap();
+        m.write_int(pdata + 4, 4, 0x2000).unwrap();
+        // xdata: FunctionLength 10 instructions, one word of unwind codes
+        m.write_int(base + 0x2000, 4, 10 | (1 << 27)).unwrap();
+        // undo order: alloc_s 16, set_fp, save_fplr_x 48, end
+        m.write(base + 0x2004, &[0x01, 0xE1, 0x85, 0xE4]).unwrap();
+        let entry_sp = 0x30_0000u64;
+        m.write_int(entry_sp - 48, 8, 0xAAA).unwrap(); // caller's x29
+        m.write_int(entry_sp - 40, 8, 0xBBB).unwrap(); // return address
+        let module = ModuleInfo {
+            path: "t.exe".into(),
+            base,
+            size: 0x10000,
+            sections: Vec::new(),
+            pdata: Some((pdata, 8)),
+            exports: Vec::new(),
+        };
+        let mut regs = Regs::default();
+        regs.sp = entry_sp - 64;
+        regs.x[29] = entry_sp - 48;
+        regs.x[30] = 0x999;
+        let mut ptrs = NvPtrs::default();
+        let uw = virtual_unwind(&m, std::slice::from_ref(&module), &mut regs, base + 0x1010, &mut ptrs).unwrap();
+        assert_eq!(regs.sp, entry_sp, "stack pointer returns to the caller");
+        assert_eq!(regs.pc, 0xBBB, "pc comes from the saved return address");
+        assert_eq!(regs.x[29], 0xAAA, "caller's frame pointer is restored");
+        assert_eq!(uw.frame, entry_sp);
+        assert_eq!(uw.handler, 0);
+        assert_eq!(ptrs.a[11], entry_sp - 40, "lr is recorded where it was saved");
+    }
+
+    #[test]
     fn regs_round_trip_through_context_layout() {
         let mut m = mem();
         let mut r = Regs::default();

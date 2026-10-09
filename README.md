@@ -102,7 +102,7 @@ every translated behavior is verified by observing guest state after
 native execution, including chained hot loops and cache round-trips:
 
 ```console
-$ cargo test --workspace     # 109 tests: decoders, emitters, native exec, API adapters, unwinding, threads, end-to-end PE runs, CLI integration
+$ cargo test --workspace     # 115 tests: decoders, emitters, native exec, API adapters, unwinding, threads, exceptions, end-to-end PE runs, CLI integration
 ```
 
 ## License

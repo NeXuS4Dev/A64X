@@ -384,9 +384,64 @@ fn write_int(ctx: &mut ApiCtx, p: u64, size: Size, v: i64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::testutil::with_ctx;
+
+    fn units(s: &str) -> Vec<u32> {
+        s.bytes().map(|b| b as u32).collect()
+    }
+
     #[test]
-    fn whitespace_and_literals_match() {
-        assert!(super::is_space(b'\t'));
-        assert!(!super::is_space(b'a'));
+    fn scans_integers_strings_and_doubles() {
+        with_ctx(|ctx| {
+            let (pi, ps, pf) = (0x20_0000u64, 0x20_1000u64, 0x20_2000u64);
+            ctx.state.x[2] = pi;
+            ctx.state.x[3] = ps;
+            ctx.state.x[4] = pf;
+            let args = Args::regs(ctx, 2);
+            let n = sscanf(ctx, 0, b"42  hello 2.5", &units("%d %s %lf"), args).unwrap();
+            assert_eq!(n, 3);
+            assert_eq!(ctx.rd(pi, 4).unwrap(), 42);
+            assert_eq!(ctx.cstr(ps).unwrap(), b"hello");
+            assert_eq!(f64::from_bits(ctx.rd(pf, 8).unwrap()), 2.5);
+        });
+    }
+
+    #[test]
+    fn scansets_stop_at_the_first_excluded_character() {
+        with_ctx(|ctx| {
+            let (ps, pn) = (0x20_0000u64, 0x20_0100u64);
+            ctx.state.x[2] = ps;
+            ctx.state.x[3] = pn;
+            let args = Args::regs(ctx, 2);
+            let n = sscanf(ctx, 0, b"abc123", &units("%[a-c]%n"), args).unwrap();
+            assert_eq!(n, 1, "%n is not counted as an assignment");
+            assert_eq!(ctx.cstr(ps).unwrap(), b"abc");
+            assert_eq!(ctx.rd(pn, 4).unwrap(), 3);
+        });
+    }
+
+    #[test]
+    fn empty_input_is_eof_and_a_mismatch_stops_early() {
+        with_ctx(|ctx| {
+            ctx.state.x[2] = 0x20_0000;
+            let args = Args::regs(ctx, 2);
+            assert_eq!(sscanf(ctx, 0, b"", &units("%d"), args).unwrap(), -1);
+            let args = Args::regs(ctx, 2);
+            assert_eq!(sscanf(ctx, 0, b"x", &units("%d"), args).unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn hex_and_suppressed_fields() {
+        with_ctx(|ctx| {
+            let p = 0x20_0000u64;
+            ctx.state.x[2] = p;
+            let args = Args::regs(ctx, 2);
+            // %*d skips one number, %x reads hex with the 0x prefix
+            let n = sscanf(ctx, 0, b"7 0xff", &units("%*d %x"), args).unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(ctx.rd(p, 4).unwrap(), 0xFF);
+        });
     }
 }

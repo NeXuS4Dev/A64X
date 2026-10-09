@@ -184,3 +184,65 @@ fn exit_runs_atexit_handlers_before_terminating() {
         "handler ran before termination"
     );
 }
+
+fn raise_program(iat: &dyn Fn(&str) -> u64, _text_va: u64) -> Vec<u32> {
+    // RaiseException(0xE0000001, 0, 0, NULL) with no handler anywhere
+    let mut a = Vec::new();
+    a.extend(asm::mov_imm32(0, 0xE000_0001));
+    a.push(asm::movz(true, 1, 0, 0));
+    a.push(asm::movz(true, 2, 0, 0));
+    a.push(asm::movz(true, 3, 0, 0));
+    call_import(&mut a, iat("RaiseException"));
+    a
+}
+
+#[test]
+fn unhandled_exception_terminates_with_the_exception_code() {
+    let imports = [("kernel32.dll", "RaiseException")];
+    let bytes = image(&imports, &raise_program);
+    let mut g = Guest::load(&bytes, XlatConfig::default()).expect("load");
+    let out = g.run();
+    assert_eq!(out.reason, ExitReason::Exited, "{out:?}");
+    assert_eq!(out.exit_code, 0xE000_0001);
+    assert!(out.message.as_deref().unwrap_or("").contains("unhandled exception"), "{out:?}");
+}
+
+fn filter_program(iat: &dyn Fn(&str) -> u64, text_va: u64) -> Vec<u32> {
+    // SetUnhandledExceptionFilter(filter); then RaiseException(...)
+    let filter_va = text_va + 4 * filter_main_len(iat, 0) as u64;
+    let mut a = filter_main(iat, filter_va);
+    // filter(EXCEPTION_POINTERS*): store 0x55 at SHARED, return EXCEPTION_CONTINUE_SEARCH (0)
+    a.extend(asm::mov_imm64_fixed(9, SHARED));
+    a.push(asm::movz(true, 0, 0x55, 0));
+    a.push(asm::ld_st_unsigned(4, LdStOp::Store, 0, 9, 0));
+    a.push(asm::movz(true, 0, 0, 0));
+    a.push(asm::ret());
+    a
+}
+
+fn filter_main_len(iat: &dyn Fn(&str) -> u64, filter: u64) -> usize {
+    filter_main(iat, filter).len()
+}
+
+fn filter_main(iat: &dyn Fn(&str) -> u64, filter: u64) -> Vec<u32> {
+    let mut a = Vec::new();
+    a.extend(asm::mov_imm64_fixed(0, filter));
+    call_import(&mut a, iat("SetUnhandledExceptionFilter"));
+    a.extend(asm::mov_imm32(0, 0xC000_0005));
+    a.push(asm::movz(true, 1, 0, 0));
+    a.push(asm::movz(true, 2, 0, 0));
+    a.push(asm::movz(true, 3, 0, 0));
+    call_import(&mut a, iat("RaiseException"));
+    a
+}
+
+#[test]
+fn unhandled_exception_filter_runs_before_termination() {
+    let imports = [("kernel32.dll", "SetUnhandledExceptionFilter"), ("kernel32.dll", "RaiseException")];
+    let bytes = image(&imports, &filter_program);
+    let mut g = Guest::load(&bytes, XlatConfig::default()).expect("load");
+    let out = g.run();
+    assert_eq!(out.reason, ExitReason::Exited, "{out:?}");
+    assert_eq!(out.exit_code, 0xC000_0005, "terminated with the exception code");
+    assert_eq!(g.machine.mem.read_int(SHARED, 4).unwrap(), 0x55, "the filter ran as a callback");
+}

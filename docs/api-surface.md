@@ -239,4 +239,12 @@ Each is intentional and visible in the code.
 * `a64x-rt/tests/manifest.rs` binds the whole import manifest through the loader.
 * `a64x-rt/tests/e2e.rs` runs ARM64 programs through the translator: a created
   thread runs and the main thread's wait returns `WAIT_OBJECT_0`; `exit` runs
-  its `atexit` handler before terminating.
+  its `atexit` handler before terminating; an unhandled `RaiseException`
+  terminates with the exception code; the unhandled-exception filter runs as a
+  callback before that termination.
+* **Not covered end to end**: a scope-table handler (`__C_specific_handler`
+  with `__except` filters and `__finally` blocks) runs its scope walk only in
+  real MSVC-built binaries. The image builder in `a64x-pe` writes 12-byte
+  `.pdata` entries (the x64 layout); ARM64 uses 8-byte entries, so a test image
+  with an ARM64 exception table needs a builder change first. The unwinder that
+  these handlers rely on is covered by unit tests (packed and full `.xdata`).
