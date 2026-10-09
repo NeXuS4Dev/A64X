@@ -265,6 +265,15 @@ fn cmd_xlat(args: &[String]) -> u8 {
 
 // -- run ---------------------------------------------------------------------
 
+/// Windows-style path of the program as the guest sees it.
+fn windows_path(path: &str) -> String {
+    let base = std::path::Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    format!("C:\\guest\\{base}")
+}
+
 fn cmd_run(args: &[String]) -> u8 {
     let fast = args.iter().any(|a| a == "--fast");
     let trace = args.iter().any(|a| a == "--trace");
@@ -282,9 +291,18 @@ fn cmd_run(args: &[String]) -> u8 {
         Err(c) => return c,
     };
     let cmdline = guest_cmdline(path, &tail_args(args));
+    g = g.with_path(&windows_path(path));
 
     let t0 = Instant::now();
-    let out = a64x_rt::dispatch::run(&mut g.machine, &g.api, g.image.entry, &cmdline, g.image.image_base, trace);
+    let modules = [g.image.module.clone()];
+    let run_cfg = a64x_rt::RunConfig {
+        entry: g.image.entry,
+        cmdline: &cmdline,
+        image_base: g.image.image_base,
+        modules: &modules,
+        trace,
+    };
+    let out = a64x_rt::dispatch::run_with(&mut g.machine, &g.api, &run_cfg);
     let wall = t0.elapsed();
     print_outcome(&out, wall);
     outcome_code(&out)
@@ -334,7 +352,15 @@ fn cmd_cache(args: &[String]) -> u8 {
     println!("running {}…", if warm { "(cached)" } else { "(fresh)" });
 
     let t0 = Instant::now();
-    let out = a64x_rt::dispatch::run(&mut guest.machine, &guest.api, guest.image.entry, &[], guest.image.image_base, false);
+    let modules = [guest.image.module.clone()];
+    let run_cfg = a64x_rt::RunConfig {
+        entry: guest.image.entry,
+        cmdline: &[],
+        image_base: guest.image.image_base,
+        modules: &modules,
+        trace: false,
+    };
+    let out = a64x_rt::dispatch::run_with(&mut guest.machine, &guest.api, &run_cfg);
     let wall = t0.elapsed();
     print_outcome(&out, wall);
 

@@ -6,7 +6,7 @@
 //! leave translated code and land in the dispatcher's API branch.
 
 use a64x_api::gateway;
-use a64x_api::ApiLayer;
+use a64x_api::{ApiLayer, ModuleInfo, SectionInfo};
 use a64x_core::{Error, Memory, Result};
 use a64x_pe::{ImportSymbol, PeImage, IMAGE_FILE_MACHINE_ARM64};
 
@@ -25,6 +25,9 @@ pub struct LoadedImage {
     pub machine_name: &'static str,
     /// Sections mapped: (name, guest va, raw size).
     pub sections: Vec<(String, u64, u32)>,
+    /// The image as the API layer sees it (unwinding, module handles,
+    /// GetProcAddress). The path is "guest.exe" until [`crate::Guest::with_path`].
+    pub module: ModuleInfo,
 }
 
 /// How one import resolved.
@@ -47,7 +50,9 @@ pub fn validate(pe: &PeImage) -> Result<()> {
         )));
     }
     if pe.is_dll() {
-        return Err(Error::BadImage("DLL loading is not supported in v1 (load an .exe)".into()));
+        return Err(Error::BadImage(
+            "DLL loading is not supported in v1 (load an .exe)".into(),
+        ));
     }
     Ok(())
 }
@@ -58,16 +63,25 @@ pub fn validate(pe: &PeImage) -> Result<()> {
 /// sections are plain bytes at `image_base + rva`. Base relocations are
 /// applied when the preferred load address is unavailable (the loader is
 /// free to pick the base; 0x400000 is the default).
-pub fn load(mem: &mut Memory, pe: &PeImage, bytes: &[u8], image_base: u64, api: &ApiLayer) -> Result<LoadedImage> {
+pub fn load(
+    mem: &mut Memory,
+    pe: &PeImage,
+    bytes: &[u8],
+    image_base: u64,
+    api: &ApiLayer,
+) -> Result<LoadedImage> {
     validate(pe)?;
 
     // --- map sections
     let mut sections = Vec::with_capacity(pe.sections.len());
+    let mut section_infos = Vec::with_capacity(pe.sections.len());
     for s in &pe.sections {
         let dst = image_base + s.vaddr as u64;
         let n = s.raw_size.min(s.vsize.max(s.raw_size)) as usize;
         let src_start = s.raw_ptr as usize;
-        let src_end = src_start.saturating_add(s.raw_size as usize).min(bytes.len());
+        let src_end = src_start
+            .saturating_add(s.raw_size as usize)
+            .min(bytes.len());
         if src_start > src_end {
             continue;
         }
@@ -81,6 +95,12 @@ pub fn load(mem: &mut Memory, pe: &PeImage, bytes: &[u8], image_base: u64, api: 
             mem.zero(dst + s.raw_size as u64, (s.vsize - s.raw_size) as u64)?;
         }
         sections.push((s.name.clone(), dst, s.raw_size));
+        section_infos.push(SectionInfo {
+            name: s.name.clone(),
+            va: dst,
+            size: s.vsize as u64,
+            characteristics: s.flags,
+        });
     }
 
     // --- base relocations (we load at a base the image may not expect)
@@ -109,10 +129,18 @@ pub fn load(mem: &mut Memory, pe: &PeImage, bytes: &[u8], image_base: u64, api: 
         match gateway_addr {
             Some(addr) => {
                 mem.write_int(image_base + imp.iat_rva as u64, 8, addr)?;
-                imports.push(BoundImport { dll: imp.dll.clone(), symbol: imp.symbol.to_string(), gateway: Some(addr) });
+                imports.push(BoundImport {
+                    dll: imp.dll.clone(),
+                    symbol: imp.symbol.to_string(),
+                    gateway: Some(addr),
+                });
             }
             None => {
-                imports.push(BoundImport { dll: imp.dll.clone(), symbol: imp.symbol.to_string(), gateway: None });
+                imports.push(BoundImport {
+                    dll: imp.dll.clone(),
+                    symbol: imp.symbol.to_string(),
+                    gateway: None,
+                });
                 missing.push(format!("{}!{}", imp.dll, imp.symbol));
             }
         }
@@ -124,6 +152,28 @@ pub fn load(mem: &mut Memory, pe: &PeImage, bytes: &[u8], image_base: u64, api: 
         )));
     }
 
+    // --- module description for the API layer
+    let (exc_rva, exc_size) = pe.directories[a64x_pe::parse::dir::EXCEPTION];
+    let pdata = if exc_rva != 0 && exc_size != 0 {
+        Some((image_base + exc_rva as u64, exc_size))
+    } else {
+        None
+    };
+    let exports = pe
+        .exports()?
+        .into_iter()
+        .filter(|e| !e.is_forwarder)
+        .filter_map(|e| e.name.map(|n| (n, image_base + e.rva as u64)))
+        .collect();
+    let module = ModuleInfo {
+        path: "guest.exe".to_string(),
+        base: image_base,
+        size: pe.size_of_image as u64,
+        sections: section_infos,
+        pdata,
+        exports,
+    };
+
     Ok(LoadedImage {
         entry: image_base + pe.entry_point as u64,
         image_base,
@@ -131,6 +181,7 @@ pub fn load(mem: &mut Memory, pe: &PeImage, bytes: &[u8], image_base: u64, api: 
         imports,
         machine_name: pe.machine_name(),
         sections,
+        module,
     })
 }
 
