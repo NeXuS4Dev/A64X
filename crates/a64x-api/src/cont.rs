@@ -56,6 +56,8 @@ pub(crate) enum Frame {
     MathErr { lr: u64, ex: u64, prev_errno: i32 },
     /// Return the callee's result unchanged to `lr`.
     Passthrough { lr: u64 },
+    /// The invalid-parameter handler returned: the function returns `ret`.
+    InvalidParam { lr: u64, ret: u64 },
 }
 
 /// Push a continuation frame onto the running thread.
@@ -244,6 +246,10 @@ pub(crate) fn resume_adapter(ctx: &mut ApiCtx) -> Result<()> {
         }
         Frame::Passthrough { lr } => {
             finish_value(ctx, lr, value);
+            Ok(())
+        }
+        Frame::InvalidParam { lr, ret } => {
+            finish_value(ctx, lr, ret);
             Ok(())
         }
     }

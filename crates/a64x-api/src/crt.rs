@@ -15,6 +15,8 @@ const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 const EAGAIN: i32 = 11;
 const ERANGE: i32 = 34;
+/// Exit status of a process terminated by an unhandled invalid parameter.
+const FAST_FAIL_INVALID_PARAMETER: u64 = 0xC000_0409;
 
 /// Number of `_sys_errlist` entries (errno values 0..=42).
 pub(crate) const SYS_NERR: u32 = 43;
@@ -438,12 +440,29 @@ fn strerror(ctx: &mut ApiCtx) -> Result<()> {
     Ok(())
 }
 
+/// An invalid parameter was passed to a CRT function: the registered
+/// invalid-parameter handler is called with the function name, and the
+/// function then returns `ret`. Without a handler the process terminates
+/// with the UCRT fast-fail status (STATUS_STACK_BUFFER_OVERRUN class).
+pub(crate) fn invalid_parameter(ctx: &mut ApiCtx, func: &str, ret: u64) -> Result<()> {
+    let handler = ctx.p.crt.invalid_param;
+    if handler == 0 {
+        ctx.exit_message = Some(format!("invalid parameter passed to {func}"));
+        cont::finish_process(ctx, FAST_FAIL_INVALID_PARAMETER);
+        return Ok(());
+    }
+    let units: Vec<u16> = func.encode_utf16().collect();
+    let name = ctx.intern_wstr(&units)?;
+    let lr = ctx.state.x[30];
+    cont::call_guest(ctx, handler, &[0, name, 0, 0, 0], cont::Frame::InvalidParam { lr, ret });
+    Ok(())
+}
+
 fn strerror_s(ctx: &mut ApiCtx) -> Result<()> {
     let (buf, size, e) = (ctx.a(0), ctx.a(1), ctx.ai(2));
     if buf == 0 || size == 0 {
         ctx.set_errno(EINVAL);
-        ctx.ret_i32(EINVAL);
-        return Ok(());
+        return invalid_parameter(ctx, "strerror_s", EINVAL as u64);
     }
     let text = strerror_text(e).as_bytes();
     let fit = (size - 1).min(text.len() as u64);

@@ -651,6 +651,29 @@ mod adapter_tests {
     }
 
     #[test]
+    fn invalid_parameter_without_handler_terminates() {
+        with_ctx(|ctx| {
+            let r = call(ctx, "ucrtbase", "strerror_s", &[0, 0, 2]);
+            assert_eq!(r, 0, "the call did not return normally");
+            assert_eq!(ctx.state.running, 0);
+            assert_eq!(ctx.state.exit_code, 0xC000_0409);
+        });
+    }
+
+    #[test]
+    fn strerror_s_copies_and_truncates() {
+        with_ctx(|ctx| {
+            let buf = 0x20_0000;
+            let r = call(ctx, "ucrtbase", "strerror_s", &[buf, 6, 2]);
+            assert_eq!(r, 34, "ERANGE when the message is truncated");
+            assert_eq!(ctx.cstr(buf).unwrap(), b"No su");
+            let full = call(ctx, "ucrtbase", "strerror_s", &[buf, 64, 2]);
+            assert_eq!(full, 0);
+            assert_eq!(ctx.cstr(buf).unwrap(), b"No such file or directory");
+        });
+    }
+
+    #[test]
     fn printf_percent_n_is_rejected() {
         with_ctx(|ctx| {
             let buf = 0x20_0000;

@@ -220,6 +220,10 @@ Each is intentional and visible in the code.
   kernel object), so closing one handle does not invalidate the other.
 * **`_set_new_mode`** records the mode; the runtime does not call a new-handler
   on allocation failure.
+* **Invalid parameters**: `strerror_s` (NULL buffer or zero size) calls the
+  handler registered with `_set_invalid_parameter_handler`, or terminates with
+  `0xC0000409` when none is set. The other CRT functions that validate their
+  arguments return `EINVAL` without calling the handler.
 * **`%n`** in printf is rejected (EINVAL), the UCRT default.
 * **strtod/strtol range**: `strtol` family clamps to the 32-bit `long` range
   (`ERANGE` on clamp); `strtod` reports `ERANGE` on overflow and on underflow to
